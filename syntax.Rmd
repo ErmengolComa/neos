@@ -1,0 +1,220 @@
+---
+title: Neos analysis
+output: html_notebook
+---
+
+```{r message=TRUE, warning=TRUE, include=FALSE}
+library("data.table")
+library("ggplot2")
+library("lubridate")
+library("kableExtra")
+library("forecast")
+
+Sys.setlocale("LC_TIME", "C")
+```
+
+# Load data
+
+```{r}
+load("data/neos_data.RData")
+load("data/neos_data_selected.RData")
+load("data/data_dx_procedures.RData")
+```
+
+# Descriptive table
+
+```{r}
+neos_data[, Periods_analysis := ifelse(Year < 2019, "2014-2018", Year)]
+
+descriptive_t_neos <- neos_data[, .(
+  `New malignant neoplasms diagnoses` = sum(Value[Variable == "Total"], na.rm = T),
+  `Monthly mean IA` = mean(Rate[Variable == "Total"], na.rm = T)
+), Periods_analysis]
+
+descriptive_t_pop <- neos_data[year(date) %in% c("2018", "2019", "2020"), .(
+  `Population`= Population[Variable == "Total" & month(date) == 1],
+  `% Women` = Population[Variable == "Women" & month(date) == 1]/Population[Variable == "Total" & month(date) == 1]*100,
+  `N > 64 years old` = Population[Variable == "Older than 64" & month(date) == 1]/Population[Variable == "Total" & month(date) == 1]*100,
+  `N 1st Q` = Population[Variable == "1st Q (least deprived)" & month(date) == 1]/Population[Variable == "Total" & month(date) == 1]*100,
+  `N 2nd Q` = Population[Variable == "2nd Q" & month(date) == 1]/Population[Variable == "Total" & month(date) == 1]*100,
+  `N 3rd Q` = Population[Variable == "3rd Q" & month(date) == 1]/Population[Variable == "Total" & month(date) == 1]*100,
+  `N 4th Q` = Population[Variable == "4th Q (most deprived)" & month(date) == 1]/Population[Variable == "Total" & month(date) == 1]*100,
+  `N Rural areas` = Population[Variable == "Rural" & month(date) == 1]/Population[Variable == "Total" & month(date) == 1]*100
+), Periods_analysis]
+
+
+descriptive_t <-cbind(descriptive_t_neos, descriptive_t_pop)
+descriptive_t_melt <- melt(descriptive_t, id.vars = "Periods_analysis", measure.vars = setdiff(names(descriptive_t), "Periods_analysis"))
+descriptive_t_melt_dcast <- dcast(descriptive_t_melt, variable ~ Periods_analysis)
+# fwrite(descriptive_t_melt_dcast, "table1.csv", sep = ";", dec = ".", row.names = F)
+```
+
+```{r}
+ia_neos <- neos_data[, .(
+  N_diagnoses = sum(Value),
+  Mean_IA = mean(Rate, na.rm = T)
+), c("Variable", "Periods_analysis")]
+
+neos_data_selected[, Periods_analysis := ifelse(Year < 2019, "2014-2018", Year)]
+
+ia_neos_selected <- neos_data_selected[, .(
+  N_diagnoses = sum(Value),
+  Mean_IA = mean(Rate)
+), c("Variable", "Periods_analysis")]
+
+t_ia <- rbind(ia_neos, ia_neos_selected)
+setorder(t_ia, Variable, Periods_analysis)
+# fwrite(t_ia, "suppl_tale_2.csv", sep = ";", dec = ".", row.names = F)
+```
+
+
+# Time series fitting
+
+```{r}
+fit_ts <- function(d){
+  dx_ts <- ts(d[order(date)][Year < 2019, Rate], frequency = 12)
+  dxfit <- tslm(dx_ts ~ trend + season)
+  pred <- forecast(dxfit, h =  21, level = c(80, 90, 95))
+  dt_predict <- as.data.table(pred)
+  dt_predict[, date :=  unique(d[Year > 2018, date])]
+  dt_predict[, Variable := unique(d$Variable)]
+  dt_predict_observed <- merge(dt_predict, d[, c("date", "Variable", "Value", "Population", "Rate")], by = c("date", "Variable"))
+  dt_predict_observed
+}
+```
+
+```{r fig.height=8, fig.width=8}
+generate_plot <- function(d){
+  ggplot(d, aes(x = date)) +
+  geom_line(aes(y = Rate, linetype = "Observed")) +
+  geom_point(aes(y = Rate)) +
+  geom_line(aes(y = `Point Forecast`, linetype = "Expected")) +
+  geom_ribbon(aes(ymin = `Lo 95`, ymax = `Hi 95`), fill = "grey", alpha = .5) +
+  theme_classic() + labs(x = "Months", y = "Incidence per 100.000 population", linetype = "") +
+  scale_linetype_manual(values = c("Expected" = 2, "Observed" = 1)) +
+  scale_x_date(breaks = "1 month", date_labels = "%Y-%b") +
+  theme(axis.text.x = element_text(angle = 90, vjust = .5),
+        legend.position = "bottom") + ylim(0, NA) + facet_wrap(~ Variable, scales = "free_y", nrow = 3)}
+
+```
+
+## Monthly new malignant neoplasms diagnoses
+
+```{r message=FALSE, warning=FALSE}
+neos_data_split <- split(neos_data, neos_data$Variable, drop = TRUE)
+neos_predictions <- do.call("rbind", lapply(neos_data_split, fit_ts))
+```
+
+### By Age
+
+```{r fig.height=8, fig.width=8}
+tiff("figure1.jpg", units="in", width=8, height=8, res=600)
+generate_plot(neos_predictions[Variable %in% c("Total", "Between 15 and 64", "Older than 64")])
+dev.off()
+```
+
+### By Sex
+
+```{r fig.height=6, fig.width=8}
+tiff("figure2.jpg", units="in", width=8, height=8, res=600)
+generate_plot(neos_predictions[Variable %in% c("Women", "Men")])
+dev.off()
+```
+
+### By Socio-economic status
+
+```{r fig.height=8, fig.width=8}
+tiff("figure4.jpg", units="in", width=8, height=8, res=600)
+generate_plot(neos_predictions[Variable %in% c("1st Q (least deprived)", "2nd Q", "3rd Q", "4th Q (most deprived)", "Rural")])
+dev.off()
+```
+
+### By type of cancer
+
+```{r message=FALSE, warning=FALSE}
+neos_data_selected_split <- split(neos_data_selected, neos_data_selected$Variable, drop = TRUE)
+
+neos_predictions_by_type <- do.call("rbind", lapply(neos_data_selected_split, fit_ts))
+```
+
+```{r fig.height=8, fig.width=8}
+tiff("figure3.jpg", units="in", width=8, height=8, res=600)
+generate_plot(neos_predictions_by_type)
+dev.off()
+```
+
+## By diagnostic procedures
+
+```{r message=FALSE, warning=FALSE}
+data_dx_procedures_split <- split(data_dx_procedures, data_dx_procedures$Variable, drop = TRUE)
+
+data_dx_procedures_predictions <- do.call("rbind", lapply(data_dx_procedures_split, fit_ts))
+```
+
+```{r fig.height=8, fig.width=8}
+tiff("figure5.jpg", units="in", width=8, height=8, res=600)
+generate_plot(data_dx_procedures_predictions)
+dev.off()
+```
+
+# Underdiagnostic or excess
+
+```{r}
+predictions_all_data <- rbind(
+  neos_predictions,
+  neos_predictions_by_type,
+  data_dx_procedures_predictions
+)
+```
+
+
+```{r}
+predictions_all_data[, paste0(c("Point Forecast", "Hi 95", "Lo 95"), "_N") := lapply(.SD, function(x){
+  x*Population/100000
+}), .SDcols = c("Point Forecast", "Hi 95", "Lo 95")]
+
+predictions_all_data[, paste0(c("Point Forecast", "Hi 95", "Lo 95"), "_underdiagnostic") := lapply(.SD, function(x){
+  ifelse(Rate < `Lo 95`, x - Value, 0)
+}), .SDcols = paste0(c("Point Forecast", "Hi 95", "Lo 95"), "_N")]
+
+predictions_all_data[, paste0(c("Point Forecast", "Hi 95", "Lo 95"), "_excess") := lapply(.SD, function(x){
+  ifelse(Rate > `Hi 95`, Value - x, 0)
+}), .SDcols = paste0(c("Point Forecast", "Hi 95", "Lo 95"), "_N")]
+
+predictions_all_data[, paste0(c("Point Forecast", "Hi 95", "Lo 95"), "_underdiagnostic_lockdown") := lapply(.SD, function(x){
+  ifelse(Rate < `Lo 95` & date >= as.Date("2020-03-01") & date <= as.Date("2020-06-01"), x - Value, 0)
+}), .SDcols = paste0(c("Point Forecast", "Hi 95", "Lo 95"), "_N")]
+
+predictions_all_data[, paste0(c("Point Forecast", "Hi 95", "Lo 95"), "_excess_lockdown") := lapply(.SD, function(x){
+  ifelse(Rate > `Hi 95` & date >= as.Date("2020-03-01") & date <= as.Date("2020-06-01"), Value - x, 0)
+}), .SDcols = paste0(c("Point Forecast", "Hi 95", "Lo 95"), "_N")]
+
+predictions_all_data[, paste0(c("Point Forecast", "Hi 95", "Lo 95"), "_underdiagnostic_after_lockdown") := lapply(.SD, function(x){
+  ifelse(Rate < `Lo 95` & date > as.Date("2020-06-01"), x - Value, 0)
+}), .SDcols = paste0(c("Point Forecast", "Hi 95", "Lo 95"), "_N")]
+
+predictions_all_data[, paste0(c("Point Forecast", "Hi 95", "Lo 95"), "_excess_after_lockdown") := lapply(.SD, function(x){
+  ifelse(Rate > `Hi 95` & date > as.Date("2020-06-01"), Value - x, 0)
+}), .SDcols = paste0(c("Point Forecast", "Hi 95", "Lo 95"), "_N")]
+
+t1 <- predictions_all_data[, lapply(.SD, function(x){round(sum(x[year(date) == 2020 & month(date) %in% 3:9], na.rm = T), 0)}), .SDcols = apply(expand.grid(c("Point Forecast", "Hi 95", "Lo 95"), c("underdiagnostic", "excess", "underdiagnostic_lockdown", "excess_lockdown", "underdiagnostic_after_lockdown", "excess_after_lockdown")), 1, paste0, collapse="_"), Variable]
+
+t2 <- predictions_all_data[, lapply(.SD, function(x){round(sum(x[year(date) == 2020 & month(date) %in% 3:9], na.rm = T), 0)}), .SDcols = c("Point Forecast_N", "Hi 95_N", "Lo 95_N"), Variable]
+names(t2)[-1] <- paste0(names(t2)[-1], "_global")
+
+t3 <- predictions_all_data[, lapply(.SD, function(x){round(sum(x[year(date) == 2020 & month(date) %in% 3:6], na.rm = T), 0)}), .SDcols = c("Point Forecast_N", "Hi 95_N", "Lo 95_N"), Variable]
+names(t3)[-1] <- paste0(names(t3)[-1], "_lockdown")
+
+t4 <- predictions_all_data[, lapply(.SD, function(x){round(sum(x[year(date) == 2020 & month(date) %in% 7:9], na.rm = T), 0)}), .SDcols = c("Point Forecast_N", "Hi 95_N", "Lo 95_N"), Variable]
+names(t4)[-1] <- paste0(names(t4)[-1], "_after_lockdown")
+
+
+
+t_underdiagnostic <- Reduce(function(...) merge(..., by = "Variable"), list(t1, t2, t3, t4))
+
+# fwrite(t_underdiagnostic, "table2.csv", sep = ";", dec = ".", row.names = F)
+```
+
+
+
+
